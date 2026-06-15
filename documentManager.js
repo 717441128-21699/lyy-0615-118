@@ -30,10 +30,14 @@ class DocumentManager {
     };
   }
 
-  addClient(docId, clientId) {
-    const doc = this.getOrCreateDocument(docId);
+  addClient(docId, clientId, initialContent = '') {
+    const existed = this.documents.has(docId);
+    const doc = this.getOrCreateDocument(docId, initialContent);
     doc.clients.add(clientId);
-    return this.getDocumentState(docId);
+    return {
+      ...this.getDocumentState(docId),
+      created: !existed
+    };
   }
 
   removeClient(docId, clientId) {
@@ -88,7 +92,54 @@ class DocumentManager {
     const doc = this.getDocument(docId);
     if (!doc) return [];
     if (version >= doc.version) return [];
-    return doc.history.slice(version);
+    const startIndex = version - (doc.version - doc.history.length);
+    if (startIndex < 0) return [];
+    return doc.history.slice(startIndex);
+  }
+
+  getSnapshot(docId) {
+    const doc = this.getDocument(docId);
+    if (!doc) return null;
+    return {
+      content: doc.content,
+      version: doc.version
+    };
+  }
+
+  getSyncData(docId, clientVersion) {
+    const doc = this.getDocument(docId);
+    if (!doc) return null;
+
+    if (clientVersion >= doc.version) {
+      return {
+        type: 'up-to-date',
+        version: doc.version,
+        content: doc.content,
+        operations: []
+      };
+    }
+
+    const oldestAvailableVersion = doc.version - doc.history.length;
+    const hasFullHistory = clientVersion >= oldestAvailableVersion;
+
+    if (hasFullHistory) {
+      const operations = this.getOperationsSince(docId, clientVersion);
+      return {
+        type: 'incremental',
+        version: doc.version,
+        baseVersion: clientVersion,
+        operations,
+        content: doc.content
+      };
+    } else {
+      return {
+        type: 'snapshot',
+        version: doc.version,
+        content: doc.content,
+        operations: [],
+        skipped: oldestAvailableVersion - clientVersion
+      };
+    }
   }
 
   getClientCount(docId) {

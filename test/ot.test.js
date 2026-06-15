@@ -205,6 +205,139 @@ console.log('\n13. Client presence management:');
   assertEqual(dm.getClientCount('doc1'), 1, '1 client after leave');
 }
 
+console.log('\n=== New Feature Tests ===\n');
+
+console.log('14. Initial content only applies on first join (Req 1):');
+{
+  const dm = new DocumentManager();
+  const state1 = dm.addClient('doc-new', 'client1', 'Hello World');
+  assert(state1.created, 'First client creates document');
+  assertEqual(state1.content, 'Hello World', 'First client content matches initial');
+
+  const state2 = dm.addClient('doc-new', 'client2', 'Different Content');
+  assert(!state2.created, 'Second client does not create document');
+  assertEqual(state2.content, 'Hello World', 'Second client sees first client content, not overridden');
+
+  dm.submitOperation('doc-new', 'client1', OT.createInsert(5, ' Beautiful'), state2.version);
+
+  const state3 = dm.addClient('doc-new', 'client3', 'Totally different');
+  assertEqual(state3.content, 'Hello Beautiful World', 'Third client sees latest edited content');
+}
+
+console.log('\n15. Insert inside delete range does not throw (Req 2):');
+{
+  const doc = 'ABCDEF';
+  const deleteOp = OT.createDelete(1, 4, 'del1');
+  const insertOp = OT.createInsert(3, 'x', 'ins1');
+
+  let error = null;
+  let result = null;
+  try {
+    result = OT.transform(insertOp, deleteOp);
+  } catch (e) {
+    error = e;
+  }
+  assert(!error, 'Transform does not throw error');
+  assert(result !== null, 'Transform returns result');
+
+  const [newInsert, newDelete] = result;
+  assertEqual(newInsert.position, 1, 'Insert moves to delete start position');
+
+  const path1 = OT.apply(OT.apply(doc, deleteOp), newInsert);
+  console.log(`    Path (delete then insert): "${path1}"`);
+  assert(path1.includes('x'), 'Inserted char still present in final doc');
+}
+
+console.log('\n16. All clients converge with insert-delete overlap (Req 2):');
+{
+  const dm = new DocumentManager();
+  dm.addClient('doc-overlap', 'client1', 'ABCDEF');
+
+  dm.submitOperation('doc-overlap', 'client1', OT.createDelete(1, 4), 0);
+
+  dm.addClient('doc-overlap', 'client2', 'ABCDEF');
+  const result = dm.submitOperation('doc-overlap', 'client2', OT.createInsert(3, 'X'), 0);
+
+  assert(result.applied, 'Insert inside deleted range is applied');
+  assertEqual(result.transformedOp.position, 1, 'Insert position transformed to delete start');
+
+  const state = dm.getDocumentState('doc-overlap');
+  console.log(`    Final content: "${state.content}"`);
+  assert(state.content.includes('X'), 'Inserted char survives in final doc');
+  assert(state.content.includes('A') && state.content.includes('F'), 'A and F still present');
+}
+
+console.log('\n17. ACK includes transformed operation details (Req 3):');
+{
+  const dm = new DocumentManager();
+  dm.addClient('doc-ack', 'client1', 'ABC');
+
+  dm.submitOperation('doc-ack', 'client1', OT.createInsert(1, 'x'), 0);
+
+  const result = dm.submitOperation('doc-ack', 'client2', OT.createInsert(1, 'y'), 0);
+
+  assert(result.applied, 'Operation applied');
+  assert(result.transformedOp, 'Transformed op present in result');
+  assert(result.transformedOp.position !== undefined, 'Transformed position available');
+  assert(result.transformedOp.type === 'insert', 'Transformed op type preserved');
+  assertEqual(result.transformedOp.chars, 'y', 'Transformed op chars preserved');
+  assert(result.newVersion > 0, 'Version incremented');
+
+  console.log(`    Original position: 1, Transformed position: ${result.transformedOp.position}`);
+  assert(result.transformedOp.position === 2, 'Position shifted after prior insert');
+}
+
+console.log('\n18. Sync returns full snapshot + operations (Req 4):');
+{
+  const dm = new DocumentManager();
+  dm.addClient('doc-sync', 'client1', '');
+
+  for (let i = 0; i < 5; i++) {
+    dm.submitOperation('doc-sync', 'client1', OT.createInsert(i, String.fromCharCode(65 + i)), i);
+  }
+
+  const syncData = dm.getSyncData('doc-sync', 2);
+  assertEqual(syncData.type, 'incremental', 'Sync type is incremental when history available');
+  assertEqual(syncData.version, 5, 'Returns latest version');
+  assertEqual(syncData.baseVersion, 2, 'Base version matches request');
+  assertEqual(syncData.operations.length, 3, 'Returns 3 missing operations');
+  assert(syncData.content, 'Returns full content snapshot');
+  assertEqual(syncData.content, 'ABCDE', 'Content snapshot is correct');
+}
+
+console.log('\n19. Sync returns snapshot-only when history is too old (Req 4):');
+{
+  const dm = new DocumentManager();
+  const doc = dm.getOrCreateDocument('doc-old', '');
+  doc.history = [];
+  doc.version = 100;
+  doc.content = 'Latest Content';
+
+  for (let i = 0; i < 10; i++) {
+    doc.history.push(OT.createInsert(i, 'x', `hist-${i}`));
+  }
+
+  const syncData = dm.getSyncData('doc-old', 0);
+  assertEqual(syncData.type, 'snapshot', 'Sync type is snapshot when history too old');
+  assert(syncData.content, 'Returns full content snapshot');
+  assertEqual(syncData.content, 'Latest Content', 'Snapshot content is correct');
+  assertEqual(syncData.version, 100, 'Returns latest version');
+  assert(syncData.skipped > 0, 'Reports skipped operation count');
+  console.log(`    Skipped ${syncData.skipped} operations, returned snapshot`);
+}
+
+console.log('\n20. Sync from up-to-date version returns up-to-date (Req 4):');
+{
+  const dm = new DocumentManager();
+  dm.addClient('doc-uptodate', 'client1', 'Hello');
+  dm.submitOperation('doc-uptodate', 'client1', OT.createInsert(5, ' World'), 0);
+
+  const syncData = dm.getSyncData('doc-uptodate', 1);
+  assertEqual(syncData.type, 'up-to-date', 'Sync type is up-to-date');
+  assertEqual(syncData.operations.length, 0, 'No operations returned');
+  assertEqual(syncData.version, 1, 'Version matches');
+}
+
 console.log('\n=== Results ===');
 console.log(`Passed: ${passed}`);
 console.log(`Failed: ${failed}`);

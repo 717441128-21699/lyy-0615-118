@@ -64,10 +64,7 @@ class OperationalTransform {
       newInsert.position = insertOp.position - deleteOp.length;
     } else {
       newInsert.position = deleteOp.position;
-      const beforeCount = insertOp.position - deleteOp.position;
       newDelete.length = deleteOp.length + insertOp.chars.length;
-      newDelete.position = deleteOp.position + beforeCount;
-      throw new Error('Overlapping insert and delete not fully handled');
     }
 
     return [newInsert, newDelete];

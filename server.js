@@ -113,6 +113,7 @@ class CollaborativeEditorServer {
       docId,
       content: state.content,
       version: state.version,
+      created: state.created,
       clientCount: this.docManager.getClientCount(docId)
     });
 
@@ -151,7 +152,10 @@ class CollaborativeEditorServer {
       this.sendToClient(clientId, {
         type: 'ack',
         opId: message.opId || null,
-        version: result.newVersion
+        version: result.newVersion,
+        originalOp: op,
+        transformedOp: result.transformedOp,
+        baseVersion
       });
 
       this.broadcastToDoc(client.docId, {
@@ -179,14 +183,23 @@ class CollaborativeEditorServer {
       return;
     }
 
-    const ops = this.docManager.getOperationsSince(client.docId, version);
-    const state = this.docManager.getDocumentState(client.docId);
+    const syncData = this.docManager.getSyncData(client.docId, version || 0);
+
+    if (!syncData) {
+      this.sendToClient(clientId, { type: 'error', message: 'Document not found' });
+      return;
+    }
+
+    client.lastVersion = syncData.version;
 
     this.sendToClient(clientId, {
       type: 'syncResponse',
-      version: state.version,
-      operations: ops,
-      content: state.content
+      syncType: syncData.type,
+      version: syncData.version,
+      baseVersion: syncData.baseVersion || 0,
+      operations: syncData.operations || [],
+      content: syncData.content,
+      skipped: syncData.skipped || 0
     });
   }
 
