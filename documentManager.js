@@ -3,6 +3,11 @@ const OT = require('./ot');
 class DocumentManager {
   constructor() {
     this.documents = new Map();
+    this._opIdCounter = 0;
+  }
+
+  _generateOpId(clientId) {
+    return `${String(this._opIdCounter++).padStart(10, '0')}-${clientId}`;
   }
 
   getOrCreateDocument(docId, initialContent = '') {
@@ -11,7 +16,9 @@ class DocumentManager {
         content: initialContent,
         version: 0,
         history: [],
-        clients: new Set()
+        clients: new Set(),
+        pendingOps: [],
+        snapshots: [initialContent]
       });
     }
     return this.documents.get(docId);
@@ -47,7 +54,7 @@ class DocumentManager {
     }
   }
 
-  submitOperation(docId, clientId, op, baseVersion) {
+  submitOperation(docId, clientId, op, baseVersion, providedOpId = null) {
     const doc = this.getDocument(docId);
     if (!doc) {
       throw new Error(`Document ${docId} not found`);
@@ -57,34 +64,181 @@ class DocumentManager {
       throw new Error(`Base version ${baseVersion} is ahead of current version ${doc.version}`);
     }
 
-    let transformedOp = { ...op, id: `${clientId}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}` };
+    const opId = providedOpId || (op.id ? `${op.id}-${clientId}` : this._generateOpId(clientId));
+    const opWithId = { ...op, id: opId };
+
+    const pendingEntry = {
+      clientId,
+      op: opWithId,
+      baseVersion,
+      result: null
+    };
+    doc.pendingOps.push(pendingEntry);
+
+    this._processPendingOps(doc);
+
+    return pendingEntry.result;
+  }
+
+  _processPendingOps(doc) {
+    let madeProgress = true;
+    while (madeProgress) {
+      madeProgress = false;
+
+      const readyOps = doc.pendingOps.filter(p => p.baseVersion <= doc.version && p.result === null);
+      if (readyOps.length === 0) break;
+
+      const minBase = Math.min(...readyOps.map(p => p.baseVersion));
+      const sameBaseReady = readyOps.filter(p => p.baseVersion === minBase);
+
+      if (minBase === doc.version) {
+        sameBaseReady.sort((a, b) => (a.op.id || '').localeCompare(b.op.id || ''));
+        const entry = sameBaseReady[0];
+        entry.result = this._applySingleOperation(doc, entry.clientId, entry.op, entry.baseVersion);
+        madeProgress = true;
+        continue;
+      }
+
+      const entry = sameBaseReady[0];
+      const histAtBase = doc.history.slice(0, minBase);
+      const histAfterBase = doc.history.slice(minBase);
+
+      const replayOps = [];
+      for (const h of histAfterBase) replayOps.push({ source: 'history', op: h });
+      for (const p of sameBaseReady) {
+        if (p.baseVersion === minBase) replayOps.push({ source: 'pending', op: p.op, entry: p });
+      }
+      replayOps.sort((a, b) => (a.op.id || '').localeCompare(b.op.id || ''));
+
+      doc.version = minBase;
+      doc.content = doc.snapshots[minBase];
+      doc.history = histAtBase.slice();
+      doc.snapshots = doc.snapshots.slice(0, minBase + 1);
+
+      const pendingResults = new Map();
+
+      for (const item of replayOps) {
+        const transformed = OT.transformAgainstHistory({ ...item.op },
+          doc.history.slice(minBase));
+
+        let applied = true;
+        let applyError = null;
+        try {
+          doc.content = OT.apply(doc.content, transformed);
+        } catch (e) {
+          applied = false;
+          applyError = e.message;
+        }
+
+        if (applied) {
+          doc.history.push(transformed);
+          doc.snapshots.push(doc.content);
+          doc.version++;
+        }
+
+        if (item.source === 'pending') {
+          const overlapInfo = [];
+          for (const histOp of histAfterBase) {
+            if ((item.op.type === 'insert' && histOp.type === 'delete') ||
+                (item.op.type === 'delete' && histOp.type === 'insert')) {
+              const insPos = item.op.type === 'insert' ? item.op.position : histOp.position;
+              const delStart = item.op.type === 'delete' ? item.op.position : histOp.position;
+              const delEnd = item.op.type === 'delete' ? item.op.position + item.op.length : histOp.position + histOp.length;
+              if (insPos > delStart && insPos < delEnd) {
+                overlapInfo.push({
+                  type: 'insert_preserved_at_boundary',
+                  withOpId: histOp.id,
+                  originalInsertPosition: insPos,
+                  newPosition: transformed.position,
+                  preserved: true,
+                  boundary: 'start'
+                });
+              }
+            }
+          }
+          pendingResults.set(item.op.id, {
+            applied,
+            originalOp: { ...item.op },
+            transformedOp: transformed,
+            baseVersion: minBase,
+            newVersion: doc.version,
+            overlapInfo,
+            applyError
+          });
+        }
+      }
+
+      for (const p of sameBaseReady) {
+        p.result = pendingResults.get(p.op.id) || {
+          applied: false, originalOp: { ...p.op }, transformedOp: p.op,
+          baseVersion: minBase, newVersion: doc.version, overlapInfo: [],
+          applyError: 'Not applied during replay'
+        };
+      }
+
+      madeProgress = true;
+    }
+
+    doc.pendingOps = doc.pendingOps.filter(p => p.result === null);
+  }
+
+  _applySingleOperation(doc, clientId, op, baseVersion) {
+    let transformedOp = { ...op };
+    const overlapInfo = [];
 
     if (baseVersion < doc.version) {
       const historySince = doc.history.slice(baseVersion);
+      for (const histOp of historySince) {
+        if ((op.type === 'insert' && histOp.type === 'delete') ||
+            (op.type === 'delete' && histOp.type === 'insert')) {
+          const insPos = op.type === 'insert' ? op.position : histOp.position;
+          const delStart = op.type === 'delete' ? op.position : histOp.position;
+          const delEnd = op.type === 'delete' ? op.position + op.length : histOp.position + histOp.length;
+          if (insPos > delStart && insPos < delEnd) {
+            overlapInfo.push({
+              type: 'insert_preserved_at_boundary',
+              withOpId: histOp.id,
+              originalInsertPosition: insPos,
+              newPosition: null,
+              preserved: true,
+              boundary: 'start'
+            });
+          }
+        }
+      }
       transformedOp = OT.transformAgainstHistory(transformedOp, historySince);
+      for (const info of overlapInfo) {
+        info.newPosition = transformedOp.position;
+      }
     }
 
     let applied = true;
+    let applyError = null;
     try {
       doc.content = OT.apply(doc.content, transformedOp);
     } catch (e) {
       applied = false;
-      console.error('Failed to apply operation:', e.message);
+      applyError = e.message;
     }
 
     if (applied) {
       doc.version++;
       doc.history.push(transformedOp);
+      doc.snapshots.push(doc.content);
 
-      if (doc.history.length > 1000) {
-        doc.history = doc.history.slice(-500);
+      while (doc.snapshots.length > 500 && doc.history.length > 500) {
+        doc.snapshots.shift();
       }
     }
 
     return {
       applied,
+      originalOp: { ...op },
       transformedOp,
-      newVersion: doc.version
+      baseVersion,
+      newVersion: doc.version,
+      overlapInfo,
+      applyError
     };
   }
 
@@ -115,12 +269,23 @@ class DocumentManager {
         type: 'up-to-date',
         version: doc.version,
         content: doc.content,
+        baseContent: doc.snapshots[doc.version] || doc.content,
         operations: []
       };
     }
 
     const oldestAvailableVersion = doc.version - doc.history.length;
     const hasFullHistory = clientVersion >= oldestAvailableVersion;
+
+    const oldestSnapshotVersion = doc.version - (doc.snapshots.length - 1);
+    let baseContent;
+    if (clientVersion >= oldestSnapshotVersion && clientVersion < doc.snapshots.length) {
+      baseContent = doc.snapshots[clientVersion];
+    } else if (doc.snapshots.length > 0) {
+      baseContent = doc.snapshots[doc.snapshots.length - 1];
+    } else {
+      baseContent = doc.content;
+    }
 
     if (hasFullHistory) {
       const operations = this.getOperationsSince(docId, clientVersion);
@@ -129,13 +294,15 @@ class DocumentManager {
         version: doc.version,
         baseVersion: clientVersion,
         operations,
-        content: doc.content
+        content: doc.content,
+        baseContent
       };
     } else {
       return {
         type: 'snapshot',
         version: doc.version,
         content: doc.content,
+        baseContent: doc.content,
         operations: [],
         skipped: oldestAvailableVersion - clientVersion
       };

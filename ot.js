@@ -58,13 +58,19 @@ class OperationalTransform {
     const newInsert = { ...insertOp };
     const newDelete = { ...deleteOp };
 
-    if (insertOp.position <= deleteOp.position) {
-      newDelete.position = deleteOp.position + insertOp.chars.length;
-    } else if (insertOp.position >= deleteOp.position + deleteOp.length) {
-      newInsert.position = insertOp.position - deleteOp.length;
+    const delStart = deleteOp.position;
+    const delEnd = deleteOp.position + deleteOp.length;
+    const insPos = insertOp.position;
+
+    if (insPos <= delStart) {
+      newDelete.position = delStart + insertOp.chars.length;
+    } else if (insPos >= delEnd) {
+      newInsert.position = insPos - deleteOp.length;
     } else {
-      newInsert.position = deleteOp.position;
-      newDelete.length = deleteOp.length + insertOp.chars.length;
+      newInsert.position = delStart;
+      const beforeLen = insPos - delStart;
+      newDelete.position = delStart;
+      newDelete.length = beforeLen + (delEnd - insPos);
     }
 
     return [newInsert, newDelete];

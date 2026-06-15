@@ -126,7 +126,7 @@ class CollaborativeEditorServer {
   }
 
   handleOperation(clientId, message) {
-    const { op, baseVersion } = message;
+    const { op, baseVersion, opId } = message;
     const client = this.clients.get(clientId);
 
     if (!client || !client.docId) {
@@ -143,7 +143,8 @@ class CollaborativeEditorServer {
       client.docId,
       clientId,
       op,
-      baseVersion
+      baseVersion,
+      opId
     );
 
     if (result.applied) {
@@ -151,25 +152,30 @@ class CollaborativeEditorServer {
 
       this.sendToClient(clientId, {
         type: 'ack',
-        opId: message.opId || null,
+        opId: opId || null,
         version: result.newVersion,
-        originalOp: op,
+        originalOp: result.originalOp,
         transformedOp: result.transformedOp,
-        baseVersion
+        baseVersion: result.baseVersion,
+        overlapInfo: result.overlapInfo
       });
 
       this.broadcastToDoc(client.docId, {
         type: 'operation',
         op: result.transformedOp,
         version: result.newVersion,
-        fromClient: clientId
+        fromClient: clientId,
+        overlapInfo: result.overlapInfo
       }, clientId);
 
-      console.log(`[${clientId}] ${op.type} at ${op.position} in '${client.docId}' -> v${result.newVersion}`);
+      const logInfo = result.overlapInfo.length > 0
+        ? `, overlap: ${result.overlapInfo.map(o => o.type).join(',')}`
+        : '';
+      console.log(`[${clientId}] ${op.type} at ${op.position} in '${client.docId}' -> v${result.newVersion}${logInfo}`);
     } else {
       this.sendToClient(clientId, {
         type: 'error',
-        message: 'Operation failed to apply'
+        message: `Operation failed to apply: ${result.applyError || 'unknown error'}`
       });
     }
   }
